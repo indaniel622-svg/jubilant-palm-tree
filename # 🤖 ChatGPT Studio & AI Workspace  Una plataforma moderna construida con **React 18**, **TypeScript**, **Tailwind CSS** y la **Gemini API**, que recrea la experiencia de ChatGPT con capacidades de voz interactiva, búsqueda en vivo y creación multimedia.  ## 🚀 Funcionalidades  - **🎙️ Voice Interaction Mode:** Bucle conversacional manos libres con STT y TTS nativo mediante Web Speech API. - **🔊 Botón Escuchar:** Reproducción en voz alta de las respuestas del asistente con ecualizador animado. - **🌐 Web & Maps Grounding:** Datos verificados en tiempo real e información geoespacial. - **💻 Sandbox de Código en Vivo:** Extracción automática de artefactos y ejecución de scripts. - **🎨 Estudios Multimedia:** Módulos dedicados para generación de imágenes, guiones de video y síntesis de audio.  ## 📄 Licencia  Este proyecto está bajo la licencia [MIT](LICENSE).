@@ -1,0 +1,15 @@
+# 🤖 ChatGPT Studio & AI Workspace
+
+Una plataforma moderna construida con **React 18**, **TypeScript**, **Tailwind CSS** y la **Gemini API**, que recrea la experiencia de ChatGPT con capacidades de voz interactiva, búsqueda en vivo y creación multimedia.
+
+## 🚀 Funcionalidades
+
+- **🎙️ Voice Interaction Mode:** Bucle conversacional manos libres con STT y TTS nativo mediante Web Speech API.
+- **🔊 Botón Escuchar:** Reproducción en voz alta de las respuestas del asistente con ecualizador animado.
+- **🌐 Web & Maps Grounding:** Datos verificados en tiempo real e información geoespacial.
+- **💻 Sandbox de Código en Vivo:** Extracción automática de artefactos y ejecución de scripts.
+- **🎨 Estudios Multimedia:** Módulos dedicados para generación de imágenes, guiones de video y síntesis de audio.
+
+## 📄 Licencia
+
+Este proyecto está bajo la licencia [MIT](LICENSE).
