@@ -1,14 +1,18 @@
 'use strict';
 
-// Netlify Function: gemini-proxy
-// - Verifica el ID token de Firebase (requiere FIREBASE_SERVICE_ACCOUNT en env)
-// - Usa GEMINI_API_KEY en env para llamar a la API de Gemini (no usar VITE_ prefix)
-// - El cliente debe enviar el Firebase ID token en Authorization: Bearer <ID_TOKEN>
+// Netlify Function: gemini-proxy (improved)
+// - Verifies Firebase ID token (requires FIREBASE_SERVICE_ACCOUNT in env)
+// - Forwards the request body to GEMINI_ENDPOINT with Authorization: Bearer GEMINI_API_KEY
+// - Performs lightweight per-user rate limiting (in-memory, per-function-instance)
+// - Expects the client to send the payload that the Gemini API expects (body forwarded as-is)
 
-const fetch = globalThis.fetch;
 const admin = require('firebase-admin');
 
-// Initialize Firebase Admin once per cold start
+// In-memory rate limiter: map uid -> { count, resetAt }
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10); // 1 minute
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '60', 10); // 60 requests per window
+const rateMap = new Map();
+
 function initFirebaseAdmin() {
   if (admin.apps && admin.apps.length) return;
   const svc = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -19,7 +23,7 @@ function initFirebaseAdmin() {
   try {
     parsed = JSON.parse(svc);
   } catch (err) {
-    // If the service account was stored with newlines escaped, try to replace
+    // Try to fix escaped newlines
     try {
       parsed = JSON.parse(svc.replace(/\\n/g, '\n'));
     } catch (err2) {
@@ -31,19 +35,36 @@ function initFirebaseAdmin() {
   });
 }
 
+function checkRateLimit(uid) {
+  const now = Date.now();
+  const entry = rateMap.get(uid) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + RATE_LIMIT_WINDOW_MS;
+  }
+  entry.count += 1;
+  rateMap.set(uid, entry);
+  return {
+    allowed: entry.count <= RATE_LIMIT_MAX,
+    count: entry.count,
+    remaining: Math.max(0, RATE_LIMIT_MAX - entry.count),
+    resetAt: entry.resetAt
+  };
+}
+
 exports.handler = async (event) => {
   try {
     if (event.httpMethod !== 'POST') {
       return { statusCode: 405, body: JSON.stringify({ error: 'Method Not Allowed' }) };
     }
 
-    // Require that GEMINI_API_KEY is set
-    if (!process.env.GEMINI_API_KEY) {
-      console.error('Missing GEMINI_API_KEY in environment');
-      return { statusCode: 500, body: JSON.stringify({ error: 'Server misconfiguration: GEMINI_API_KEY not set' }) };
+    // Ensure GEMINI config exists
+    if (!process.env.GEMINI_API_KEY || !process.env.GEMINI_ENDPOINT) {
+      console.error('Missing GEMINI_API_KEY or GEMINI_ENDPOINT in environment');
+      return { statusCode: 500, body: JSON.stringify({ error: 'Server misconfiguration: GEMINI_API_KEY or GEMINI_ENDPOINT not set' }) };
     }
 
-    // Initialize Firebase Admin and require verification
+    // Initialize Firebase Admin and verify token
     try {
       initFirebaseAdmin();
     } catch (err) {
@@ -51,7 +72,6 @@ exports.handler = async (event) => {
       return { statusCode: 500, body: JSON.stringify({ error: 'Server misconfiguration: FIREBASE_SERVICE_ACCOUNT not set or invalid' }) };
     }
 
-    // Validate Authorization header (Firebase ID token)
     const authHeader = event.headers?.authorization || event.headers?.Authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return { statusCode: 401, body: JSON.stringify({ error: 'Missing Authorization header (Bearer <ID_TOKEN>)' }) };
@@ -66,16 +86,29 @@ exports.handler = async (event) => {
       return { statusCode: 401, body: JSON.stringify({ error: 'Invalid or expired ID token' }) };
     }
 
-    // Parse body
-    const body = event.body ? JSON.parse(event.body) : {};
-    const { prompt, options } = body;
-    if (!prompt) {
-      return { statusCode: 400, body: JSON.stringify({ error: 'Missing prompt' }) };
+    const uid = decoded.uid || decoded.sub || 'anonymous';
+
+    // Rate limit per uid
+    const rl = checkRateLimit(uid);
+    if (!rl.allowed) {
+      return { statusCode: 429, body: JSON.stringify({ error: 'Rate limit exceeded', details: { remaining: rl.remaining, resetAt: rl.resetAt } }) };
     }
 
-    // Build request to Gemini API
-    // TODO: Reemplaza la URL y el payload según la API real de Gemini que uses.
-    const geminiEndpoint = process.env.GEMINI_ENDPOINT || 'https://api.gemini.example/v1/generate';
+    // Parse and validate body
+    let bodyPayload;
+    try {
+      bodyPayload = event.body ? JSON.parse(event.body) : {};
+    } catch (err) {
+      return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON body' }) };
+    }
+
+    // Basic validation: ensure there's something to send (client controls exact schema)
+    if (!bodyPayload || Object.keys(bodyPayload).length === 0) {
+      return { statusCode: 400, body: JSON.stringify({ error: 'Empty payload. Include the request body for the Gemini API.' }) };
+    }
+
+    // Forward request to GEMINI_ENDPOINT
+    const geminiEndpoint = process.env.GEMINI_ENDPOINT;
 
     const res = await fetch(geminiEndpoint, {
       method: 'POST',
@@ -83,15 +116,29 @@ exports.handler = async (event) => {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${process.env.GEMINI_API_KEY}`
       },
-      body: JSON.stringify({ prompt, ...(options || {}) })
+      body: JSON.stringify(bodyPayload)
     });
 
-    const data = await res.json();
+    const responseBody = await res.text();
+    let parsedResponse = null;
+    try {
+      parsedResponse = JSON.parse(responseBody);
+    } catch (err) {
+      // Non-JSON response, return raw text
+    }
 
+    // Return structured wrapper with some metadata
     return {
       statusCode: res.ok ? 200 : 502,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: 'gemini-proxy', ok: res.ok, status: res.status, data })
+      body: JSON.stringify({
+        from: 'gemini-proxy',
+        ok: res.ok,
+        status: res.status,
+        uid,
+        rate: { count: rl.count, remaining: rl.remaining, resetAt: rl.resetAt },
+        data: parsedResponse !== null ? parsedResponse : responseBody
+      })
     };
   } catch (err) {
     console.error('gemini-proxy error:', err);
