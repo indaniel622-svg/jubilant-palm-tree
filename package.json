@@ -18,7 +18,8 @@
     "firebase": "^10.0.0",
     "axios": "^1.6.0",
     "zustand": "^4.4.0",
-    "date-fns": "^2.30.0"
+    "date-fns": "^2.30.0",
+    "firebase-admin": "^11.11.0"
   },
   "devDependencies": {
     "vite": "^5.0.0",
