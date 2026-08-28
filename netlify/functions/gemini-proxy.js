@@ -1,10 +1,11 @@
 'use strict';
 
-// Netlify Function: gemini-proxy (minimal, optional Firebase verification)
-// - Forwards the request body to GEMINI_ENDPOINT with Authorization: Bearer GEMINI_API_KEY
+// Netlify Function: gemini-proxy (minimal, with optional Firebase verification)
+// - Forwards a mapped payload to GEMINI_ENDPOINT with Authorization: Bearer GEMINI_API_KEY
 // - If FIREBASE_SERVICE_ACCOUNT is set, verifies Firebase ID tokens (Authorization: Bearer <ID_TOKEN>)
 // - If FIREBASE_SERVICE_ACCOUNT is NOT set, the proxy accepts requests without Firebase auth (use with caution)
 // - Lightweight in-memory per-user rate limiting
+// - If client sends { prompt: string }, it will be mapped to { model, input }
 
 let admin = null;
 let firebaseEnabled = false;
@@ -53,6 +54,27 @@ function checkRateLimit(key) {
   return { allowed: e.count <= RATE_LIMIT_MAX, info: { count: e.count, remaining: Math.max(0, RATE_LIMIT_MAX - e.count), resetAt: e.resetAt } };
 }
 
+function mapPayload(bodyPayload) {
+  // If client sends { prompt: '...' } and not messages/input, map to { model, input }
+  if (!bodyPayload) return bodyPayload;
+  if (bodyPayload.messages) {
+    // chat-style payload, pass as-is
+    return bodyPayload;
+  }
+  if (typeof bodyPayload.prompt === 'string' && !bodyPayload.input) {
+    const model = bodyPayload.model || process.env.DEFAULT_GEMINI_MODEL || 'gemini-3.5';
+    const mapped = { model, input: bodyPayload.prompt };
+    // copy other options like temperature, max_output_tokens, etc.
+    const opts = Object.assign({}, bodyPayload);
+    delete opts.prompt;
+    delete opts.model;
+    // merge opts into mapped
+    return Object.assign(mapped, opts);
+  }
+  // otherwise pass through
+  return bodyPayload;
+}
+
 exports.handler = async (event) => {
   try {
     if (event.httpMethod !== 'POST') {
@@ -92,12 +114,6 @@ exports.handler = async (event) => {
       uid = event.headers['x-forwarded-for'] || event.requestContext?.identity?.sourceIp || 'anonymous';
     }
 
-    // Rate limit
-    const rl = checkRateLimit(uid);
-    if (!rl.allowed) {
-      return { statusCode: 429, body: JSON.stringify({ error: 'Rate limit exceeded', details: rl.info }) };
-    }
-
     // Parse body
     let bodyPayload;
     try {
@@ -110,6 +126,15 @@ exports.handler = async (event) => {
       return { statusCode: 400, body: JSON.stringify({ error: 'Empty payload. Include the request body for the Gemini API.' }) };
     }
 
+    // Rate limit
+    const rl = checkRateLimit(uid);
+    if (!rl.allowed) {
+      return { statusCode: 429, body: JSON.stringify({ error: 'Rate limit exceeded', details: rl.info }) };
+    }
+
+    // Map payload (support prompt -> input mapping)
+    const forwardPayload = mapPayload(bodyPayload);
+
     // Forward to GEMINI_ENDPOINT
     const res = await fetch(process.env.GEMINI_ENDPOINT, {
       method: 'POST',
@@ -117,12 +142,12 @@ exports.handler = async (event) => {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${process.env.GEMINI_API_KEY}`
       },
-      body: JSON.stringify(bodyPayload)
+      body: JSON.stringify(forwardPayload)
     });
 
     const text = await res.text();
     let parsed = null;
-    try { parsed = JSON.parse(text); } catch (_) { /* ignore */ }
+    try { parsed = JSON.parse(text); } catch (_) { /* ignore non-JSON */ }
 
     return {
       statusCode: res.ok ? 200 : 502,
