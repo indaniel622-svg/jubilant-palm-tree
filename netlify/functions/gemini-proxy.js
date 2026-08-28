@@ -1,55 +1,56 @@
 'use strict';
 
-// Netlify Function: gemini-proxy (improved)
-// - Verifies Firebase ID token (requires FIREBASE_SERVICE_ACCOUNT in env)
+// Netlify Function: gemini-proxy (minimal, optional Firebase verification)
 // - Forwards the request body to GEMINI_ENDPOINT with Authorization: Bearer GEMINI_API_KEY
-// - Performs lightweight per-user rate limiting (in-memory, per-function-instance)
-// - Expects the client to send the payload that the Gemini API expects (body forwarded as-is)
+// - If FIREBASE_SERVICE_ACCOUNT is set, verifies Firebase ID tokens (Authorization: Bearer <ID_TOKEN>)
+// - If FIREBASE_SERVICE_ACCOUNT is NOT set, the proxy accepts requests without Firebase auth (use with caution)
+// - Lightweight in-memory per-user rate limiting
 
-const admin = require('firebase-admin');
+let admin = null;
+let firebaseEnabled = false;
 
-// In-memory rate limiter: map uid -> { count, resetAt }
-const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10); // 1 minute
-const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '60', 10); // 60 requests per window
-const rateMap = new Map();
-
-function initFirebaseAdmin() {
-  if (admin.apps && admin.apps.length) return;
+function tryInitFirebase() {
+  if (firebaseEnabled) return;
   const svc = process.env.FIREBASE_SERVICE_ACCOUNT;
-  if (!svc) {
-    throw new Error('FIREBASE_SERVICE_ACCOUNT environment variable is required for token verification');
-  }
-  let parsed;
+  if (!svc) return; // not enabled
+
   try {
-    parsed = JSON.parse(svc);
-  } catch (err) {
-    // Try to fix escaped newlines
+    // dynamic require so we don't force firebase-admin in deps unless used
+    // eslint-disable-next-line global-require
+    const adminModule = require('firebase-admin');
+    let parsed;
     try {
+      parsed = JSON.parse(svc);
+    } catch (err) {
+      // try to fix escaped newlines
       parsed = JSON.parse(svc.replace(/\\n/g, '\n'));
-    } catch (err2) {
-      throw new Error('FIREBASE_SERVICE_ACCOUNT is not valid JSON');
     }
+    if (!adminModule.apps || !adminModule.apps.length) {
+      adminModule.initializeApp({ credential: adminModule.credential.cert(parsed) });
+    }
+    admin = adminModule;
+    firebaseEnabled = true;
+    console.log('Firebase Admin initialized in function (verification enabled)');
+  } catch (err) {
+    console.error('Failed to initialize firebase-admin. If you want Firebase token verification, install firebase-admin and set FIREBASE_SERVICE_ACCOUNT:', err.message);
+    throw err; // let caller handle
   }
-  admin.initializeApp({
-    credential: admin.credential.cert(parsed)
-  });
 }
 
-function checkRateLimit(uid) {
+// Simple in-memory rate limiter
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10);
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '60', 10);
+const rateMap = new Map();
+function checkRateLimit(key) {
   const now = Date.now();
-  const entry = rateMap.get(uid) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
-  if (now > entry.resetAt) {
-    entry.count = 0;
-    entry.resetAt = now + RATE_LIMIT_WINDOW_MS;
+  const e = rateMap.get(key) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+  if (now > e.resetAt) {
+    e.count = 0;
+    e.resetAt = now + RATE_LIMIT_WINDOW_MS;
   }
-  entry.count += 1;
-  rateMap.set(uid, entry);
-  return {
-    allowed: entry.count <= RATE_LIMIT_MAX,
-    count: entry.count,
-    remaining: Math.max(0, RATE_LIMIT_MAX - entry.count),
-    resetAt: entry.resetAt
-  };
+  e.count += 1;
+  rateMap.set(key, e);
+  return { allowed: e.count <= RATE_LIMIT_MAX, info: { count: e.count, remaining: Math.max(0, RATE_LIMIT_MAX - e.count), resetAt: e.resetAt } };
 }
 
 exports.handler = async (event) => {
@@ -58,43 +59,46 @@ exports.handler = async (event) => {
       return { statusCode: 405, body: JSON.stringify({ error: 'Method Not Allowed' }) };
     }
 
-    // Ensure GEMINI config exists
     if (!process.env.GEMINI_API_KEY || !process.env.GEMINI_ENDPOINT) {
-      console.error('Missing GEMINI_API_KEY or GEMINI_ENDPOINT in environment');
+      console.error('GEMINI_API_KEY or GEMINI_ENDPOINT missing');
       return { statusCode: 500, body: JSON.stringify({ error: 'Server misconfiguration: GEMINI_API_KEY or GEMINI_ENDPOINT not set' }) };
     }
 
-    // Initialize Firebase Admin and verify token
-    try {
-      initFirebaseAdmin();
-    } catch (err) {
-      console.error('Firebase init error:', err.message);
-      return { statusCode: 500, body: JSON.stringify({ error: 'Server misconfiguration: FIREBASE_SERVICE_ACCOUNT not set or invalid' }) };
+    // Initialize Firebase admin only if FIREBASE_SERVICE_ACCOUNT is present
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+      try {
+        tryInitFirebase();
+      } catch (err) {
+        return { statusCode: 500, body: JSON.stringify({ error: 'Failed to initialize firebase-admin. Install firebase-admin and set valid FIREBASE_SERVICE_ACCOUNT.' }) };
+      }
     }
 
-    const authHeader = event.headers?.authorization || event.headers?.Authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return { statusCode: 401, body: JSON.stringify({ error: 'Missing Authorization header (Bearer <ID_TOKEN>)' }) };
+    let uid = 'anonymous';
+    if (firebaseEnabled) {
+      const authHeader = event.headers?.authorization || event.headers?.Authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return { statusCode: 401, body: JSON.stringify({ error: 'Missing Authorization header (Bearer <ID_TOKEN>)' }) };
+      }
+      const idToken = authHeader.split('Bearer ')[1];
+      try {
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        uid = decoded.uid || decoded.sub || uid;
+      } catch (err) {
+        console.error('Token verification failed:', err.message);
+        return { statusCode: 401, body: JSON.stringify({ error: 'Invalid or expired ID token' }) };
+      }
+    } else {
+      // Not verifying tokens — use IP-based key for rate limiting if available
+      uid = event.headers['x-forwarded-for'] || event.requestContext?.identity?.sourceIp || 'anonymous';
     }
-    const idToken = authHeader.split('Bearer ')[1];
 
-    let decoded;
-    try {
-      decoded = await admin.auth().verifyIdToken(idToken);
-    } catch (err) {
-      console.error('Token verification failed:', err);
-      return { statusCode: 401, body: JSON.stringify({ error: 'Invalid or expired ID token' }) };
-    }
-
-    const uid = decoded.uid || decoded.sub || 'anonymous';
-
-    // Rate limit per uid
+    // Rate limit
     const rl = checkRateLimit(uid);
     if (!rl.allowed) {
-      return { statusCode: 429, body: JSON.stringify({ error: 'Rate limit exceeded', details: { remaining: rl.remaining, resetAt: rl.resetAt } }) };
+      return { statusCode: 429, body: JSON.stringify({ error: 'Rate limit exceeded', details: rl.info }) };
     }
 
-    // Parse and validate body
+    // Parse body
     let bodyPayload;
     try {
       bodyPayload = event.body ? JSON.parse(event.body) : {};
@@ -102,15 +106,12 @@ exports.handler = async (event) => {
       return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON body' }) };
     }
 
-    // Basic validation: ensure there's something to send (client controls exact schema)
     if (!bodyPayload || Object.keys(bodyPayload).length === 0) {
       return { statusCode: 400, body: JSON.stringify({ error: 'Empty payload. Include the request body for the Gemini API.' }) };
     }
 
-    // Forward request to GEMINI_ENDPOINT
-    const geminiEndpoint = process.env.GEMINI_ENDPOINT;
-
-    const res = await fetch(geminiEndpoint, {
+    // Forward to GEMINI_ENDPOINT
+    const res = await fetch(process.env.GEMINI_ENDPOINT, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -119,26 +120,14 @@ exports.handler = async (event) => {
       body: JSON.stringify(bodyPayload)
     });
 
-    const responseBody = await res.text();
-    let parsedResponse = null;
-    try {
-      parsedResponse = JSON.parse(responseBody);
-    } catch (err) {
-      // Non-JSON response, return raw text
-    }
+    const text = await res.text();
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch (_) { /* ignore */ }
 
-    // Return structured wrapper with some metadata
     return {
       statusCode: res.ok ? 200 : 502,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        from: 'gemini-proxy',
-        ok: res.ok,
-        status: res.status,
-        uid,
-        rate: { count: rl.count, remaining: rl.remaining, resetAt: rl.resetAt },
-        data: parsedResponse !== null ? parsedResponse : responseBody
-      })
+      body: JSON.stringify({ from: 'gemini-proxy', ok: res.ok, status: res.status, uid, rate: rl.info, data: parsed !== null ? parsed : text })
     };
   } catch (err) {
     console.error('gemini-proxy error:', err);
